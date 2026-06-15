@@ -1,0 +1,57 @@
+services:
+  python-cognitive-api:
+    build:
+      context: ./python-api
+      dockerfile: Dockerfile
+      target: development
+    container_name: python-stress-service
+    ports:
+      - "8008:8000"
+    environment:
+      TZ: UTC
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      HF_HOME: /app/.cache/huggingface
+    volumes:
+      - ./python-api:/app
+      - python-huggingface-cache:/app/.cache/huggingface
+    networks:
+      - stress-dev-network
+    restart: unless-stopped
+
+  vocal-stress-web-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: stress-react-dashboard
+    depends_on:
+      - python-cognitive-api
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      NODE_ENV: development
+
+      # Server-side/container-to-container API URL
+      COGNITIVE_API_URL: http://python-cognitive-api:8000
+
+      # Useful for hot reload when running Docker on Windows/WSL/Mac
+      CHOKIDAR_USEPOLLING: "true"
+      WATCHPACK_POLLING: "true"
+    volumes:
+      - .:/app
+      - web-node-modules:/app/node_modules
+      - web-dist:/app/dist
+    networks:
+      - stress-dev-network
+    restart: unless-stopped
+
+volumes:
+  python-huggingface-cache:
+  web-node-modules:
+  web-dist:
+
+networks:
+  stress-dev-network:
+    driver: bridge

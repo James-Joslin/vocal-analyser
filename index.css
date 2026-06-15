@@ -1,0 +1,48 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Outfit", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Outfit", ui-monospace, SFMono-Regular, monospace;
+}
+
+/* Custom scrollbar overrides for a pristine minimalist dark UI */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.4);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(51, 65, 85, 0.6);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(139, 92, 246, 0.6);
+}
+
+/* Print optimizations specifically for formatted stress reports saved as PDF */
+@media print {
+  body {
+    background: #ffffff !important;
+    color: #1a1a1a !important;
+  }
+  
+  header, footer, #scenario-selector-rail, #settings-panel, #exporter-buttons-row, #btn-start-recording, #btn-stop-recording {
+    display: none !important;
+  }
+  
+  #print-dashboard-report, #d3-wave-container, #d3-stress-radar-container, #transcript-feed-container {
+    border: 1px solid #e2e8f0 !important;
+    background: #ffffff !important;
+    box-shadow: none !important;
+  }
+  
+  h1, h2, h3, p, span, div {
+    color: #000000 !important;
+  }
+}

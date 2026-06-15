@@ -1,0 +1,6 @@
+{
+  "name": "Acoustic Stress Monitor",
+  "description": "Real-time vocal stress analysis and transcript sentiment processing using hybrid Web Audio metrics and self-hosted AI-driven stress classification.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": [""]
+}
