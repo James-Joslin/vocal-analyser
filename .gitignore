@@ -1,3 +1,13 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
