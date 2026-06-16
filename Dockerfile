@@ -6,7 +6,6 @@ FROM node:20 AS base
 WORKDIR /app
 
 COPY package*.json ./
-
 RUN npm ci
 
 # ---------------------------------------------------------
@@ -22,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     && rm -rf /var/lib/apt/lists/*
 
-EXPOSE 3000
+EXPOSE 3001
 
 CMD ["npm", "run", "dev"]
 
@@ -32,16 +31,14 @@ CMD ["npm", "run", "dev"]
 FROM base AS builder
 
 COPY . .
-
 RUN npm run build
 
 # ---------------------------------------------------------
-# Production Runtime Stage
+# Production Stage
 # ---------------------------------------------------------
 FROM node:20-slim AS production
 
 WORKDIR /app
-
 ENV NODE_ENV=production
 
 COPY --from=builder /app/package*.json ./
@@ -49,6 +46,6 @@ COPY --from=builder /app/dist ./dist
 
 RUN npm ci --omit=dev
 
-EXPOSE 3000
+EXPOSE 3001
 
 CMD ["npm", "run", "start"]

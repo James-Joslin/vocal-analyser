@@ -4,25 +4,24 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
 export default defineConfig(() => {
+  const port = Number(process.env.VITE_PORT || 3000);
   const disableHmr = process.env.DISABLE_HMR === "true";
 
   return {
     plugins: [react(), tailwindcss()],
+
     resolve: {
       alias: {
-        "@": path.resolve(__dirname, "."),
+        "@": path.resolve(__dirname, "src"),
       },
     },
+
     server: {
       host: "0.0.0.0",
-      port: Number(process.env.VITE_PORT || 3001),
+      port,
       strictPort: true,
 
-      hmr: disableHmr
-        ? false
-        : {
-            clientPort: Number(process.env.VITE_PORT || 3001),
-          },
+      hmr: disableHmr ? false : { clientPort: port },
 
       proxy: {
         "/api": {
