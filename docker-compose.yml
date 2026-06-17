@@ -5,8 +5,11 @@ services:
       dockerfile: Dockerfile
       target: development
     container_name: python-stress-service
+    command: ["tail", "-f", "/dev/null"]
+    stdin_open: true
+    tty: true
     ports:
-      - "8008:8000"
+      - "8010:8000"
     environment:
       TZ: UTC
       PYTHONUNBUFFERED: "1"
@@ -27,16 +30,17 @@ services:
     container_name: stress-react-dashboard
     depends_on:
       - python-cognitive-api
+    command: ["tail", "-f", "/dev/null"]
+    stdin_open: true
+    tty: true
     ports:
-      - "3000:3000"
+      - "3001:3001"
     environment:
-      PORT: "3000"
+      PORT: "3001"
       NODE_ENV: development
-
-      # Server-side/container-to-container API URL
+      VITE_PORT: "3001"
+      VITE_API_TARGET: http://python-cognitive-api:8000
       COGNITIVE_API_URL: http://python-cognitive-api:8000
-
-      # Useful for hot reload when running Docker on Windows/WSL/Mac
       CHOKIDAR_USEPOLLING: "true"
       WATCHPACK_POLLING: "true"
     volumes:

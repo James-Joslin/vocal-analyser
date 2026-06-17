@@ -1,12 +1,16 @@
 # ---------------------------------------------------------
-# Base Stage
+# Base Stage — Node.js for the React/Vite frontend + Express
 # ---------------------------------------------------------
-FROM node:20 AS base
+FROM node:20-slim AS base
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY package*.json ./
-
+COPY package.json package-lock.json ./
 RUN npm ci
 
 # ---------------------------------------------------------
@@ -14,41 +18,25 @@ RUN npm ci
 # ---------------------------------------------------------
 FROM base AS development
 
-ENV NODE_ENV=development
+# Source is bind-mounted via docker-compose volumes, so no COPY needed.
+# Container stays alive via `tail`; exec in to run manually:
+#
+#   npm run dev        →  Vite dev server + Express proxy
+#   npm run build      →  production bundle
+#   npx tsc --noEmit   →  type-check
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    git \
-    procps \
-    && rm -rf /var/lib/apt/lists/*
+EXPOSE 3001
 
-EXPOSE 3000
-
-CMD ["npm", "run", "dev"]
+CMD ["tail", "-f", "/dev/null"]
 
 # ---------------------------------------------------------
-# Builder Stage
+# Production Stage
 # ---------------------------------------------------------
-FROM base AS builder
+FROM base AS production
 
 COPY . .
-
 RUN npm run build
 
-# ---------------------------------------------------------
-# Production Runtime Stage
-# ---------------------------------------------------------
-FROM node:20-slim AS production
-
-WORKDIR /app
-
-ENV NODE_ENV=production
-
-COPY --from=builder /app/package*.json ./
-COPY --from=builder /app/dist ./dist
-
-RUN npm ci --omit=dev
-
-EXPOSE 3000
+EXPOSE 3001
 
 CMD ["npm", "run", "start"]
