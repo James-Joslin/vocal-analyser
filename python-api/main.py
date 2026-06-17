@@ -3,6 +3,7 @@ import re
 import uuid
 import tempfile
 import subprocess
+from collections import Counter
 from contextlib import asynccontextmanager
 from typing import List, Dict, Any, Optional
 
@@ -246,6 +247,29 @@ def is_whisper_hallucination(text: str) -> bool:
     return cleaned in WHISPER_HALLUCINATIONS
 
 
+def is_decoder_loop(text: str) -> bool:
+    """
+    Detect Whisper decoder loops where a word or short phrase repeats
+    endlessly (e.g. "yeah, yeah, yeah, ..." × 200).
+
+    Returns True if any single token makes up more than half the words
+    and the output is long enough for that to be meaningful (≥ 8 words).
+    """
+    # Normalise: lowercase, strip punctuation noise
+    words = re.findall(r"[a-zA-Z]+", text.lower())
+    if len(words) < 8:
+        return False
+
+    counts = Counter(words)
+    most_common_word, most_common_count = counts.most_common(1)[0]
+    return most_common_count > len(words) * 0.5
+
+
+def is_bad_transcription(text: str) -> bool:
+    """Combined filter: static hallucinations + decoder loops."""
+    return is_whisper_hallucination(text) or is_decoder_loop(text)
+
+
 def has_speech_energy(audio: np.ndarray, threshold: float = 0.008) -> bool:
     """Quick RMS energy gate — returns False for near-silence."""
     return float(np.sqrt(np.mean(audio ** 2))) > threshold
@@ -343,19 +367,46 @@ def extract_acoustic_metrics(audio_path: str) -> Dict[str, Any]:
     rms = librosa.feature.rms(y=y)[0]
     rms_energy = float(np.mean(rms) * 1000.0) if len(rms) else 0.0
 
+    # --- Pitch estimation (fundamental frequency only) -------------------
+    # librosa.piptrack returns ALL spectral peaks — fundamentals, harmonics,
+    # and noise.  Averaging the lot produces values like 1700 Hz for normal
+    # speech, which poisons every downstream metric.  Filter to the human
+    # fundamental-frequency band (80–400 Hz) before averaging.
     pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
-    active_pitches = pitches[pitches > 0]
-    mean_pitch = float(np.mean(active_pitches)) if len(active_pitches) > 0 else 0.0
+    f0_mask = (pitches > 80) & (pitches < 400)
+    f0_pitches = pitches[f0_mask]
+    mean_pitch = float(np.mean(f0_pitches)) if len(f0_pitches) > 0 else 0.0
 
     centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
     centroid_norm = float(clamp((np.mean(centroid) / 4000.0) * 100.0)) if len(centroid) else 0.0
 
-    # Lightweight approximations suitable for UI telemetry, not clinical voice pathology.
-    pitch_frames = active_pitches[active_pitches > 50]
-    jitter = float(clamp((np.std(pitch_frames) / np.mean(pitch_frames)) * 100.0, 0, 25)) if len(pitch_frames) > 5 and np.mean(pitch_frames) > 0 else 0.0
-    shimmer = float(clamp((np.std(rms) / np.mean(rms)) * 10.0, 0, 25)) if len(rms) > 5 and np.mean(rms) > 0 else 0.0
+    # Lightweight approximations suitable for UI telemetry, not clinical
+    # voice pathology.  Jitter is now computed from the filtered F0 frames
+    # so harmonic contamination doesn't inflate the coefficient-of-variation.
+    jitter = (
+        float(clamp((np.std(f0_pitches) / np.mean(f0_pitches)) * 100.0, 0, 25))
+        if len(f0_pitches) > 5 and np.mean(f0_pitches) > 0
+        else 0.0
+    )
+    shimmer = (
+        float(clamp((np.std(rms) / np.mean(rms)) * 10.0, 0, 25))
+        if len(rms) > 5 and np.mean(rms) > 0
+        else 0.0
+    )
 
-    acoustic_heuristic = clamp((rms_energy / 2.0) + (mean_pitch / 4.0) + (centroid_norm * 0.25) + (jitter * 1.2) + (shimmer * 1.2), 10, 100)
+    # --- Stress heuristic ------------------------------------------------
+    # Use pitch *deviation* from a neutral baseline (150 Hz) instead of raw
+    # Hz.  Raw pitch dominated the sum — e.g. 200 Hz / 4 = 50 even for calm
+    # speech — leaving no headroom for the other metrics.  Deviation rewards
+    # the *change* from normal, which is what correlates with vocal stress.
+    NEUTRAL_PITCH_HZ = 150.0
+    pitch_deviation = clamp(abs(mean_pitch - NEUTRAL_PITCH_HZ) * 0.25, 0, 30) if mean_pitch > 0 else 0.0
+    energy_component = clamp(rms_energy * 0.35, 0, 30)
+
+    acoustic_heuristic = clamp(
+        energy_component + pitch_deviation + (centroid_norm * 0.25) + (jitter * 1.2) + (shimmer * 1.2),
+        10, 100,
+    )
 
     return {
         "y": y,
@@ -518,8 +569,8 @@ async def transcribe_vocal_audio(file: UploadFile = File(...)):
             asr_result = asr(wav_path, generate_kwargs={"language": "en", "task": "transcribe"})
             candidate = asr_result.get("text", "").strip()
 
-            if is_whisper_hallucination(candidate):
-                print(f"[INFO] Whisper hallucination filtered: {candidate!r}")
+            if is_bad_transcription(candidate):
+                print(f"[INFO] Whisper bad output filtered: {candidate[:80]!r}{'…' if len(candidate) > 80 else ''}")
             else:
                 transcribed_text = candidate
 
