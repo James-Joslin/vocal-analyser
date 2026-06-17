@@ -35,7 +35,37 @@ export function useAudioCapture(callbacks: AudioCaptureCallbacks = {}) {
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const chunkTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const uploadLockRef = useRef(false);
+
+  // ---- Client-side voice-activity detection ----
+  // Polls the AnalyserNode 5×/sec and flips a flag when energy exceeds a
+  // speech threshold.  The flag is checked before uploading each chunk —
+  // if nobody spoke during the window, the chunk is silently discarded
+  // instead of being sent to Whisper (which would hallucinate on the
+  // background noise).
+  const speechDetectedRef = useRef(false);
+
+  useEffect(() => {
+    if (!isRecording || isSimulated || !analyser) return;
+
+    const buf = new Uint8Array(analyser.fftSize);
+    const SPEECH_RMS_THRESHOLD = 0.015;
+
+    const handle = setInterval(() => {
+      analyser.getByteTimeDomainData(buf);
+      let acc = 0;
+      for (let i = 0; i < buf.length; i++) {
+        const norm = (buf[i] - 128) / 128;
+        acc += norm * norm;
+      }
+      if (Math.sqrt(acc / buf.length) > SPEECH_RMS_THRESHOLD) {
+        speechDetectedRef.current = true;
+      }
+    }, 200);
+
+    return () => clearInterval(handle);
+  }, [isRecording, isSimulated, analyser]);
 
   // ---- Audio upload (always sends to the Python API container) ----
   const uploadBlob = useCallback(async (blob: Blob) => {
@@ -73,23 +103,48 @@ export function useAudioCapture(callbacks: AudioCaptureCallbacks = {}) {
     };
 
     recorder.onstop = () => {
+      const hadSpeech = speechDetectedRef.current;
+      speechDetectedRef.current = false; // reset for next chunk window
+
       const blob = new Blob(chunksRef.current, {
         type: recorder.mimeType || "audio/webm",
       });
       chunksRef.current = [];
-      uploadBlob(blob);
+
+      // Only send to Whisper if speech was detected during this window.
+      // Background-noise-only chunks would just produce hallucinations
+      // ("thank you for watching", "I'm sorry", etc.).
+      if (hadSpeech) {
+        uploadBlob(blob);
+      }
 
       // Restart for the next chunk if the session is still active.
       if (recordingRef.current && !simulatedRef.current) {
-        try { recorder.start(6000); } catch { /* stream may have ended */ }
+        try { recorder.start(); } catch { /* stream may have ended */ }
       }
     };
 
-    recorder.start(6000);
+    // Start without a timeslice — we manage chunking ourselves via the
+    // interval below.  Each stop/start cycle produces an independent,
+    // fully-headed webm file that ffmpeg & librosa can decode cleanly.
+    recorder.start();
     mediaRecorderRef.current = recorder;
+
+    // Periodically stop the recorder to trigger the onstop→upload→restart
+    // cycle.  This is what was missing: without it, ondataavailable accumulated
+    // data forever and uploadBlob was never called until the session ended.
+    chunkTimerRef.current = setInterval(() => {
+      if (recorder.state === "recording") {
+        recorder.stop();
+      }
+    }, 6_000);
   }, [uploadBlob]);
 
   const stopRecorder = useCallback(() => {
+    if (chunkTimerRef.current) {
+      clearInterval(chunkTimerRef.current);
+      chunkTimerRef.current = null;
+    }
     const recorder = mediaRecorderRef.current;
     if (recorder && recorder.state !== "inactive") {
       try { recorder.stop(); } catch { /* already stopped */ }

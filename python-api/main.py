@@ -2,6 +2,7 @@ import os
 import re
 import uuid
 import tempfile
+import subprocess
 from contextlib import asynccontextmanager
 from typing import List, Dict, Any, Optional
 
@@ -19,7 +20,15 @@ from transformers import pipeline
 WHISPER_MODEL_ID = os.environ.get("WHISPER_MODEL_ID", "openai/whisper-tiny")
 WAV2VEC_EMOTION_MODEL_ID = os.environ.get(
     "WAV2VEC_EMOTION_MODEL_ID",
-    "ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition",
+    # Previous default (ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition)
+    # has a classifier-head architecture mismatch with transformers >= 4.35:
+    # its trained dense/output weights are silently dropped and replaced with
+    # random projector/classifier weights, producing garbage predictions.
+    #
+    # Dpngtm/wav2vec2-emotion-recognition uses the standard
+    # AutoModelForAudioClassification head, loads cleanly, and covers the
+    # same emotion labels our stress_weights mapping expects.
+    "Dpngtm/wav2vec2-emotion-recognition",
 )
 SENTIMENT_MODEL_ID = os.environ.get(
     "SENTIMENT_MODEL_ID",
@@ -60,12 +69,42 @@ def get_wav2vec_emotion_classifier():
     if "wav2vec" not in models_cache:
         print(f"[INFO] Loading Wav2Vec2 emotion model: {WAV2VEC_EMOTION_MODEL_ID}")
         try:
-            models_cache["wav2vec"] = pipeline(
+            pipe = pipeline(
                 "audio-classification",
                 model=WAV2VEC_EMOTION_MODEL_ID,
                 device=DEVICE,
                 top_k=None,
             )
+
+            # --- Sanity check -------------------------------------------
+            # Run a 1-second silence probe through the classifier.  A
+            # properly-trained model concentrates probability on "neutral"
+            # or "calm"; a model with mismatched / random weights produces
+            # a near-uniform distribution (max score ≈ 1/num_classes).
+            # This catches the ehcalabres weight-mismatch problem *and*
+            # any future model whose checkpoint doesn't load cleanly.
+            silence = np.zeros(16000, dtype=np.float32)
+            probe = pipe(silence, sampling_rate=16000)
+            top_score = max(p["score"] for p in probe) if probe else 0
+
+            if top_score < 0.20:
+                print(
+                    f"[WARNING] Wav2Vec2 emotion model sanity check failed: "
+                    f"top prediction on silence was only {top_score:.3f} "
+                    f"(expected > 0.20 for a trained classifier).  "
+                    f"This usually means the checkpoint weights don't match "
+                    f"the model architecture.  Emotion classification is "
+                    f"DISABLED; acoustic + linguistic scoring will be used."
+                )
+                models_cache["wav2vec"] = None
+                model_status["wav2vec"].update({
+                    "loaded": False,
+                    "error": f"Sanity check failed — top score on silence: {top_score:.3f}",
+                })
+                return models_cache["wav2vec"]
+            # ------------------------------------------------------------
+
+            models_cache["wav2vec"] = pipe
             model_status["wav2vec"].update({"loaded": True, "error": None})
         except Exception as exc:
             model_status["wav2vec"].update({"loaded": False, "error": str(exc)})
@@ -150,6 +189,66 @@ def clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
 
 def normalize_label(label: str) -> str:
     return label.lower().strip().replace("label_", "")
+
+
+def ensure_wav(input_path: str) -> str:
+    """
+    Convert any audio file to 16 kHz mono WAV via ffmpeg.
+
+    This eliminates two problems at once:
+    - PySoundFile cannot decode webm containers, forcing librosa to fall back
+      to the deprecated ``audioread`` loader (removed in librosa 1.0).
+    - Starting from a clean PCM WAV removes format-related edge cases for
+      Whisper, wav2vec2, and librosa's feature extractors.
+    """
+    wav_path = input_path.rsplit(".", 1)[0] + ".wav"
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", input_path, "-ar", "16000", "-ac", "1", "-f", "wav", wav_path],
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    return wav_path
+
+
+# Phrases Whisper hallucinates when fed non-speech audio (background noise,
+# birdsong, hum, silence).  Whisper-tiny is especially prone to this.
+# Checked after transcription; matches are discarded before they reach
+# the sentiment pipeline.
+WHISPER_HALLUCINATIONS = frozenset(s.lower() for s in (
+    "Thank you for watching",
+    "Thanks for watching",
+    "Thank you for listening",
+    "Thanks for listening",
+    "Please subscribe",
+    "Subscribe to my channel",
+    "Like and subscribe",
+    "See you next time",
+    "See you in the next video",
+    "I'm sorry",
+    "Goodbye",
+    "Bye",
+    "Bye bye",
+    "Bye-bye",
+    "You",
+    "...",
+    "MBC 뉴스 이덕영입니다",
+    "Sous-titrage ST' 501",
+    "ご視聴ありがとうございました",
+))
+
+
+def is_whisper_hallucination(text: str) -> bool:
+    """Return True if the text is a known Whisper noise-hallucination."""
+    cleaned = text.strip().lower().rstrip(".!,")
+    if len(cleaned) < 3:
+        return True
+    return cleaned in WHISPER_HALLUCINATIONS
+
+
+def has_speech_energy(audio: np.ndarray, threshold: float = 0.008) -> bool:
+    """Quick RMS energy gate — returns False for near-silence."""
+    return float(np.sqrt(np.mean(audio ** 2))) > threshold
 
 
 def keyword_stress(text: str) -> tuple[int, List[str]]:
@@ -368,6 +467,7 @@ async def transcribe_vocal_audio(file: UploadFile = File(...)):
 
     suffix = os.path.splitext(file.filename)[1].lower() or ".audio"
     temp_path = None
+    wav_path = None
 
     try:
         audio_bytes = await file.read()
@@ -378,14 +478,53 @@ async def transcribe_vocal_audio(file: UploadFile = File(...)):
             tmp.write(audio_bytes)
             temp_path = tmp.name
 
+        # Convert to 16 kHz mono WAV up-front so every downstream tool
+        # (Whisper, librosa, wav2vec2) gets clean PCM input.  This also
+        # eliminates the PySoundFile → audioread deprecation chain.
+        wav_path = ensure_wav(temp_path)
+
+        # ---- Energy gate ------------------------------------------------
+        # Quick pre-check: if the chunk is near-silence, skip the full model
+        # pipeline entirely.  Saves GPU/CPU time and prevents Whisper from
+        # hallucinating on ambient room noise.
+        y_gate, _ = librosa.load(wav_path, sr=16000, mono=True)
+        if not has_speech_energy(y_gate):
+            return {
+                "text": "",
+                "acousticStressScore": 10.0,
+                "linguisticStressScore": 0.0,
+                "combinedStressScore": 10.0,
+                "cognitiveLoad": "low",
+                "intervention": "No speech detected in this segment.",
+                "keywords": [],
+                "sentimentScore": 0.0,
+                "acousticFeatures": {"energy": 0, "pitch": 0, "spectralCentroid": 0, "jitter": 0, "shimmer": 0},
+                "vocalMetrics": {},
+                "wav2vecClassifierUsed": False,
+                "wav2vecPredictions": [],
+                "topEmotion": None,
+                "topEmotionScore": 0.0,
+                "status": "success",
+                "processor": "EnergyGate-BelowThreshold",
+            }
+
+        # ---- Transcription (Whisper) ------------------------------------
         asr = get_whisper_pipeline()
         transcribed_text = ""
         if asr is not None:
-            asr_result = asr(temp_path)
-            transcribed_text = asr_result.get("text", "").strip()
+            # Pin to English transcription to reduce hallucination on
+            # non-speech audio (Whisper's multilingual mode is far more
+            # prone to generating stock phrases on background noise).
+            asr_result = asr(wav_path, generate_kwargs={"language": "en", "task": "transcribe"})
+            candidate = asr_result.get("text", "").strip()
 
-        acoustic = extract_acoustic_metrics(temp_path)
-        emotion = classify_emotion(temp_path)
+            if is_whisper_hallucination(candidate):
+                print(f"[INFO] Whisper hallucination filtered: {candidate!r}")
+            else:
+                transcribed_text = candidate
+
+        acoustic = extract_acoustic_metrics(wav_path)
+        emotion = classify_emotion(wav_path)
         linguistic = analyse_text_distress(transcribed_text) if transcribed_text else {
             "sentimentScore": 0.0,
             "stressScore": 20,
@@ -401,6 +540,8 @@ async def transcribe_vocal_audio(file: UploadFile = File(...)):
         linguistic_stress = float(linguistic["stressScore"])
 
         # Distress blend: emotion/acoustic carries vocal cues; linguistic carries transcript cues.
+        # When wav2vec emotion is unavailable, emotion_stress == acoustic_stress,
+        # giving an effective 70/30 acoustic/linguistic split.
         combined_distress = clamp((emotion_stress * 0.45) + (acoustic_stress * 0.25) + (linguistic_stress * 0.30), 0, 100)
 
         return {
@@ -427,8 +568,12 @@ async def transcribe_vocal_audio(file: UploadFile = File(...)):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Transcribe failure context: {str(exc)}")
     finally:
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
+        for path in (temp_path, wav_path):
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":

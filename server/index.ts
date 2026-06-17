@@ -1,5 +1,6 @@
 import express from "express";
 import path from "path";
+import { createServer as createHttpServer } from "http";
 import { createServer as createViteServer } from "vite";
 import { createProxyMiddleware } from "http-proxy-middleware";
 import dotenv from "dotenv";
@@ -19,12 +20,24 @@ app.use("/api", scenarioRoutes);
 
 async function start() {
   if (process.env.NODE_ENV !== "production") {
-    // Development: Vite handles the frontend AND proxies /api/* to the Python API
+    // Create an explicit HTTP server so Vite can attach its HMR WebSocket
+    // to the same port.  Without this, middleware-mode Vite has no server
+    // to bind ws:// to and every HMR connection fails immediately.
+    const httpServer = createHttpServer(app);
+
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: { server: httpServer },
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);
+
+    httpServer.listen(PORT, "0.0.0.0", () => {
+      console.log(`[server] Listening on http://0.0.0.0:${PORT} (development)`);
+      console.log(`[server] Python API target: ${COGNITIVE_API_URL}`);
+    });
   } else {
     // Production: proxy /api/* to the Python API container, serve static frontend
     app.use(
@@ -40,12 +53,12 @@ async function start() {
     app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
-  }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[server] Listening on http://0.0.0.0:${PORT} (${process.env.NODE_ENV || "development"})`);
-    console.log(`[server] Python API target: ${COGNITIVE_API_URL}`);
-  });
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`[server] Listening on http://0.0.0.0:${PORT} (production)`);
+      console.log(`[server] Python API target: ${COGNITIVE_API_URL}`);
+    });
+  }
 }
 
 start().catch((err) => {
