@@ -18,7 +18,7 @@ from transformers import pipeline
 # ------------------------------------------------------------
 # MODEL CONFIG
 # ------------------------------------------------------------
-WHISPER_MODEL_ID = os.environ.get("WHISPER_MODEL_ID", "openai/whisper-tiny")
+WHISPER_MODEL_ID = os.environ.get("WHISPER_MODEL_ID", "openai/whisper-base")
 WAV2VEC_EMOTION_MODEL_ID = os.environ.get(
     "WAV2VEC_EMOTION_MODEL_ID",
     # Previous default (ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition)
